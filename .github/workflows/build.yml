@@ -1,0 +1,33 @@
+name: Build and push ostree containers
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'main'
+jobs:
+  build-push--image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+      - name: build base image
+        id: build-base-image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: fedora-ostree-deriv-test
+          tags: ${{ github.ref_name }} ${{ github.sha }}
+          containerfiles: ./Containerfile
+      - name: push base image
+        id: push-base-image
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build-base-image.outputs.image }}
+          tags: ${{ steps.build-base-image.outputs.tags }}
+          registry: ghcr.io/${{ github.repository_owner }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
