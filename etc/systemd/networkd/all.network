@@ -1,0 +1,6 @@
+# DHCP on all interfaces by default; delete this when done
+[Match]
+Name=*
+
+[Network]
+DHCP=yes
