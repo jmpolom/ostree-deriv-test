@@ -1,0 +1,2 @@
+disable systemd-resolved
+enable kresd@.service 1 2
