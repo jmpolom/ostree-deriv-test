@@ -12,6 +12,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        release_version:
+          - "39"
+          - "40"
     steps:
       - name: checkout repo
         uses: actions/checkout@v4
@@ -20,8 +25,10 @@ jobs:
         uses: redhat-actions/buildah-build@v2
         with:
           image: fedora-ostree-deriv-test
-          tags: ${{ github.ref_name }} ${{ github.sha }}
+          tags: ${{ matrix.release_version }}-${{ github.ref_name }} ${{ matrix.release_version }}-${{ github.sha }}
           containerfiles: ./Containerfile
+          build-args: |
+            tag=${{ matrix.release_version }}-main
       - name: push base image
         id: push-base-image
         uses: redhat-actions/push-to-registry@v2
