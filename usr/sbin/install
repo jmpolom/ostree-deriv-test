@@ -1,0 +1,62 @@
+#!/usr/bin/bash
+
+set -eux
+
+# root dev is a mandatory block dev
+[[ -b "$1" ]] && root_dev="$1" || exit
+# separate block dev for var allowed and must not be the same as root_dev
+[[ -v "2" ]] && { [[ -b "$2" ]] && [[ ! "$root_dev" -ef "$2" ]] && var_dev="$2" || exit ; }
+
+# wipe devices
+wipe_dev () {
+    local dev="$1"
+
+    lsblk -o PATH,TYPE -n -x PATH -E PATH "$dev" | while read -r path type; do
+        if [[ "$type" = "part" ]]; then
+            wipefs -a "$path"
+        fi
+    done
+
+    wipefs -a "$dev"
+}
+
+wipe_dev "$root_dev"
+[[ -v "var_dev" ]] && wipe_dev "$var_dev"
+
+# ESP and boot partition sizes
+# root is always the full disk and a btrfs subvol is used for /var
+esp_size=1G
+boot_size=1G
+
+sgdisk_root_command () {
+    sgdisk -Z -U R -n "1:0:+${esp_size}" -c "1:ostree-esp" -t "1:ef00" \
+        -n "2:0:+${boot_size}" -c "2:ostree-boot" -t "2:8300" \
+        -n "3:0:0" -c "3:ostree-luks-sysroot" -t "3:8300" \
+        "$@" "$root_dev"
+}
+
+# separate var device
+if [[ -v "var_dev" ]]; then
+    sgdisk_root_command -p
+    sgdisk -Z -U R -n "1:0:0" -c "1:ostree-luks-var" -t "1:8300" "$var_dev"
+else
+# default single device
+    sgdisk_root_command -p
+fi
+
+# udev does not process the partition changes instantly..
+sleep 1
+udevadm settle
+
+# format filesystems and setup LUKS root
+mkfs.fat -F 32 -n "ostree-esp" /dev/disk/by-partlabel/ostree-esp
+mke2fs -t ext4 -L "ostree-boot" /dev/disk/by-partlabel/ostree-boot
+luks_uuid=$(uuidgen -r)
+cryptsetup luksFormat --uuid "$luks_uuid" /dev/disk/by-partlabel/ostree-luks-sysroot
+cryptsetup open /dev/disk/by-partlabel/ostree-luks-sysroot ostree-sysroot
+mkfs.btrfs -L "ostree-sysroot" /dev/mapper/ostree-sysroot
+
+# conditionally handle separate var device
+
+
+cryptsetup close ostree-sysroot
