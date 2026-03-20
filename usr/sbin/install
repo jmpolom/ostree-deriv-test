@@ -1,62 +1,275 @@
 #!/usr/bin/bash
 
-set -eux
+set -Eeuo pipefail
 
-# root dev is a mandatory block dev
-[[ -b "$1" ]] && root_dev="$1" || exit
-# separate block dev for var allowed and must not be the same as root_dev
-[[ -v "2" ]] && { [[ -b "$2" ]] && [[ ! "$root_dev" -ef "$2" ]] && var_dev="$2" || exit ; }
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-ghcr.io/jmpolom/fedora-ostree-base:latest}"
+TARGET_DISK="${TARGET_DISK:-/dev/nvme0n1}"
+TARGET_SYSROOT="${TARGET_SYSROOT:-/mnt/bootc-install}"
+CONTAINER_TARGET_ROOT="${CONTAINER_TARGET_ROOT:-/target}"
+PODMAN_STORE_DIR="${PODMAN_STORE_DIR:-/var/lib/containers}"
+TARGET_IMGREF="${TARGET_IMGREF:-}"
 
-# wipe devices
-function wipe_dev {
-    local dev="$1"
+ESP_SIZE_MIB="${ESP_SIZE_MIB:-1024}"
+BOOT_SIZE_MIB="${BOOT_SIZE_MIB:-2048}"
+CRYPT_NAME="${CRYPT_NAME:-bootc-root}"
+ENABLE_LUKS_DISCARDS="${ENABLE_LUKS_DISCARDS:-1}"
 
-    lsblk -o PATH,TYPE -n -x PATH -E PATH "$dev" | while read -r path type; do
-        if [[ "$type" = "part" ]]; then
-            wipefs -a "$path"
+ESP_PARTLABEL="${ESP_PARTLABEL:-bootc-esp}"
+BOOT_PARTLABEL="${BOOT_PARTLABEL:-bootc-boot}"
+LUKS_PARTLABEL="${LUKS_PARTLABEL:-bootc-luks-root}"
+
+ESP_FS_LABEL="${ESP_FS_LABEL:-BOOTC_EFI}"
+BOOT_FS_LABEL="${BOOT_FS_LABEL:-BOOTC_BOOT}"
+ROOT_FS_LABEL="${ROOT_FS_LABEL:-BOOTC_SYSROOT}"
+
+ROOT_SUBVOL="${ROOT_SUBVOL:-root}"
+HOME_SUBVOL="${HOME_SUBVOL:-home}"
+VAR_SUBVOL="${VAR_SUBVOL:-var}"
+BTRFS_COMMON_OPTS="${BTRFS_COMMON_OPTS:-compress=zstd,noatime,ssd,space_cache=v2}"
+
+ROOT_MOUNT_OPTS="subvol=${ROOT_SUBVOL},${BTRFS_COMMON_OPTS}"
+HOME_MOUNT_OPTS="subvol=${HOME_SUBVOL},${BTRFS_COMMON_OPTS}"
+VAR_MOUNT_OPTS="subvol=${VAR_SUBVOL},${BTRFS_COMMON_OPTS}"
+
+readonly CONTAINER_IMAGE
+readonly TARGET_DISK
+readonly TARGET_SYSROOT
+readonly CONTAINER_TARGET_ROOT
+readonly PODMAN_STORE_DIR
+readonly TARGET_IMGREF
+readonly ESP_SIZE_MIB
+readonly BOOT_SIZE_MIB
+readonly CRYPT_NAME
+readonly ENABLE_LUKS_DISCARDS
+readonly ESP_PARTLABEL
+readonly BOOT_PARTLABEL
+readonly LUKS_PARTLABEL
+readonly ESP_FS_LABEL
+readonly BOOT_FS_LABEL
+readonly ROOT_FS_LABEL
+readonly ROOT_SUBVOL
+readonly HOME_SUBVOL
+readonly VAR_SUBVOL
+readonly BTRFS_COMMON_OPTS
+readonly ROOT_MOUNT_OPTS
+readonly HOME_MOUNT_OPTS
+readonly VAR_MOUNT_OPTS
+
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        echo "This installer must run as root." >&2
+        exit 1
+    fi
+}
+
+require_commands() {
+    local missing=()
+    local cmd
+
+    for cmd in \
+        blkid \
+        btrfs \
+        cryptsetup \
+        lsblk \
+        mkfs.btrfs \
+        mkfs.ext4 \
+        mkfs.fat \
+        mount \
+        mountpoint \
+        podman \
+        sgdisk \
+        udevadm \
+        umount \
+        wipefs
+    do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            missing+=("${cmd}")
         fi
     done
 
-    wipefs -a "$dev"
+    if ((${#missing[@]} > 0)); then
+        printf 'Missing required commands: %s\n' "${missing[*]}" >&2
+        exit 1
+    fi
 }
 
-wipe_dev "$root_dev"
-[[ -v "var_dev" ]] && wipe_dev "$var_dev"
+cleanup() {
+    set +e
 
-# ESP and boot partition sizes
-# root is always the full disk and a btrfs subvol is used for /var
-esp_size=1G
-boot_size=1G
+    if mountpoint -q "${TARGET_SYSROOT}/boot/efi"; then
+        umount "${TARGET_SYSROOT}/boot/efi"
+    fi
 
-function sgdisk_root_command {
-    sgdisk -Z -U R -n "1:0:+${esp_size}" -c "1:ostree-esp" -t "1:ef00" \
-        -n "2:0:+${boot_size}" -c "2:ostree-boot" -t "2:8300" \
-        -n "3:0:0" -c "3:ostree-luks-sysroot" -t "3:8300" \
-        "$@" "$root_dev"
+    if mountpoint -q "${TARGET_SYSROOT}/boot"; then
+        umount "${TARGET_SYSROOT}/boot"
+    fi
+
+    if mountpoint -q "${TARGET_SYSROOT}/home"; then
+        umount "${TARGET_SYSROOT}/home"
+    fi
+
+    if mountpoint -q "${TARGET_SYSROOT}/var"; then
+        umount "${TARGET_SYSROOT}/var"
+    fi
+
+    if mountpoint -q "${TARGET_SYSROOT}"; then
+        umount "${TARGET_SYSROOT}"
+    fi
+
+    if cryptsetup status "${CRYPT_NAME}" >/dev/null 2>&1; then
+        cryptsetup close "${CRYPT_NAME}"
+    fi
 }
 
-# separate var device
-if [[ -v "var_dev" ]]; then
-    sgdisk_root_command -p
-    sgdisk -Z -U R -n "1:0:0" -c "1:ostree-luks-var" -t "1:8300" "$var_dev"
-else
-# default single device
-    sgdisk_root_command -p
-fi
+trap cleanup EXIT
 
-# udev does not process the partition changes instantly..
-sleep 1
-udevadm settle
+wipe_target_disk() {
+    lsblk -lnpo PATH,TYPE "${TARGET_DISK}" | while read -r path type; do
+        if [[ "${type}" == "part" ]]; then
+            wipefs --all --force "${path}"
+        fi
+    done
 
-# format filesystems and setup LUKS root
-mkfs.fat -F 32 -n "ostree-esp" /dev/disk/by-partlabel/ostree-esp
-mke2fs -t ext4 -L "ostree-boot" /dev/disk/by-partlabel/ostree-boot
-luks_uuid=$(uuidgen -r)
-cryptsetup luksFormat --uuid "$luks_uuid" /dev/disk/by-partlabel/ostree-luks-sysroot
-cryptsetup open /dev/disk/by-partlabel/ostree-luks-sysroot ostree-sysroot
-mkfs.btrfs -L "ostree-sysroot" /dev/mapper/ostree-sysroot
+    wipefs --all --force "${TARGET_DISK}"
+    sgdisk --zap-all --clear "${TARGET_DISK}"
+}
 
-# conditionally handle separate var device
+partition_target_disk() {
+    sgdisk \
+        --new=1:0:+"${ESP_SIZE_MIB}"MiB \
+        --typecode=1:ef00 \
+        --change-name=1:"${ESP_PARTLABEL}" \
+        --new=2:0:+"${BOOT_SIZE_MIB}"MiB \
+        --typecode=2:8300 \
+        --change-name=2:"${BOOT_PARTLABEL}" \
+        --new=3:0:0 \
+        --typecode=3:8309 \
+        --change-name=3:"${LUKS_PARTLABEL}" \
+        "${TARGET_DISK}"
 
+    udevadm settle
+}
 
-cryptsetup close ostree-sysroot
+format_filesystems() {
+    mkfs.fat -F 32 -n "${ESP_FS_LABEL}" "${ESP_PART}"
+    mkfs.ext4 -F -L "${BOOT_FS_LABEL}" "${BOOT_PART}"
+
+    cryptsetup luksFormat \
+        --type luks2 \
+        "${LUKS_PART}"
+
+    LUKS_UUID="$(cryptsetup luksUUID "${LUKS_PART}")"
+
+    if [[ "${ENABLE_LUKS_DISCARDS}" == "1" ]]; then
+        cryptsetup open --allow-discards "${LUKS_PART}" "${CRYPT_NAME}"
+    else
+        cryptsetup open "${LUKS_PART}" "${CRYPT_NAME}"
+    fi
+
+    mkfs.btrfs -f -L "${ROOT_FS_LABEL}" "${MAPPER_ROOT}"
+    ROOT_UUID="$(blkid -s UUID -o value "${MAPPER_ROOT}")"
+    BOOT_UUID="$(blkid -s UUID -o value "${BOOT_PART}")"
+}
+
+create_btrfs_subvolumes() {
+    mkdir -p "${TARGET_SYSROOT}"
+    mount "${MAPPER_ROOT}" "${TARGET_SYSROOT}"
+
+    btrfs subvolume create "${TARGET_SYSROOT}/${ROOT_SUBVOL}"
+    btrfs subvolume create "${TARGET_SYSROOT}/${HOME_SUBVOL}"
+    btrfs subvolume create "${TARGET_SYSROOT}/${VAR_SUBVOL}"
+
+    umount "${TARGET_SYSROOT}"
+}
+
+mount_target_layout() {
+    mount -o "${ROOT_MOUNT_OPTS}" "${MAPPER_ROOT}" "${TARGET_SYSROOT}"
+    mkdir -p "${TARGET_SYSROOT}/boot" "${TARGET_SYSROOT}/home" "${TARGET_SYSROOT}/var"
+
+    mount -o "${HOME_MOUNT_OPTS}" "${MAPPER_ROOT}" "${TARGET_SYSROOT}/home"
+    mount -o "${VAR_MOUNT_OPTS}" "${MAPPER_ROOT}" "${TARGET_SYSROOT}/var"
+    mount "${BOOT_PART}" "${TARGET_SYSROOT}/boot"
+    mkdir -p "${TARGET_SYSROOT}/boot/efi"
+    mount "${ESP_PART}" "${TARGET_SYSROOT}/boot/efi"
+}
+
+run_bootc_install() {
+    local -a bootc_args
+    local -a podman_args
+
+    bootc_args=(
+        install
+        to-filesystem
+        "--root-mount-spec=UUID=${ROOT_UUID}"
+        "--boot-mount-spec=UUID=${BOOT_UUID}"
+        "--karg=rootfstype=btrfs"
+        "--karg=rootflags=${ROOT_MOUNT_OPTS}"
+        "--karg=rd.luks.name=${LUKS_UUID}=${CRYPT_NAME}"
+        "--karg=systemd.mount-extra=UUID=${ROOT_UUID}:/home:btrfs:${HOME_MOUNT_OPTS}"
+        "--karg=systemd.mount-extra=UUID=${ROOT_UUID}:/var:btrfs:${VAR_MOUNT_OPTS}"
+    )
+
+    if [[ -n "${TARGET_IMGREF}" ]]; then
+        bootc_args+=("--target-imgref=${TARGET_IMGREF}")
+    fi
+
+    if [[ "${ENABLE_LUKS_DISCARDS}" == "1" ]]; then
+        bootc_args+=("--karg=rd.luks.options=${LUKS_UUID}=discard")
+    fi
+
+    podman_args=(
+        run
+        --rm
+        --privileged
+        --pid=host
+        --security-opt "label=type:unconfined_t"
+        -v "${PODMAN_STORE_DIR}:${PODMAN_STORE_DIR}"
+        -v "/dev:/dev"
+        -v "${TARGET_SYSROOT}:${CONTAINER_TARGET_ROOT}"
+        -v "${TARGET_SYSROOT}/boot:${CONTAINER_TARGET_ROOT}/boot"
+        -v "${TARGET_SYSROOT}/boot/efi:${CONTAINER_TARGET_ROOT}/boot/efi"
+        -v "${TARGET_SYSROOT}/home:${CONTAINER_TARGET_ROOT}/home"
+        -v "${TARGET_SYSROOT}/var:${CONTAINER_TARGET_ROOT}/var"
+        "${CONTAINER_IMAGE}"
+        bootc
+    )
+
+    podman "${podman_args[@]}" "${bootc_args[@]}" "${CONTAINER_TARGET_ROOT}"
+}
+
+main() {
+    require_root
+    require_commands
+
+    if [[ ! -b "${TARGET_DISK}" ]]; then
+        printf 'Target disk is not a block device: %s\n' "${TARGET_DISK}" >&2
+        exit 1
+    fi
+
+    printf 'Installing %s to %s\n' "${CONTAINER_IMAGE}" "${TARGET_DISK}"
+    printf 'This will destroy all existing data on %s.\n' "${TARGET_DISK}"
+
+    wipe_target_disk
+    partition_target_disk
+
+    ESP_PART="/dev/disk/by-partlabel/${ESP_PARTLABEL}"
+    BOOT_PART="/dev/disk/by-partlabel/${BOOT_PARTLABEL}"
+    LUKS_PART="/dev/disk/by-partlabel/${LUKS_PARTLABEL}"
+    MAPPER_ROOT="/dev/mapper/${CRYPT_NAME}"
+
+    readonly ESP_PART
+    readonly BOOT_PART
+    readonly LUKS_PART
+    readonly MAPPER_ROOT
+
+    format_filesystems
+    readonly LUKS_UUID
+    readonly ROOT_UUID
+    readonly BOOT_UUID
+
+    create_btrfs_subvolumes
+    mount_target_layout
+    run_bootc_install
+}
+
+main "$@"
