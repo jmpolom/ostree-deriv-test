@@ -23,3 +23,4 @@ RUN useradd -U -c 'delete me' \
 COPY etc/resolv.conf /etc/resolv.conf
 COPY etc/systemd/network/all.network /etc/systemd/network/all.network
 COPY etc/systemd/system-preset/10-dns.preset /etc/systemd/system-preset/10-dns.preset
+COPY usr/sbin/install /usr/lib/bootc/install-scripts/install
